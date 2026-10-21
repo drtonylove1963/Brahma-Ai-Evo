@@ -1112,7 +1112,8 @@ TOOL_DECLARATIONS = [
             "type": "OBJECT",
             "properties": {
                 "angle": {"type": "STRING", "description": "'screen' to capture display, 'camera' for webcam. Default: 'screen'"},
-                "text":  {"type": "STRING", "description": "The question or instruction about the captured image"}
+                "text":  {"type": "STRING", "description": "The question or instruction about the captured image"},
+                "monitor": {"type": "STRING", "description": "Which screen to capture when the user has several: a number counted left to right ('1', '2', '3'), or 'left', 'right', 'middle', 'primary'. Omit to capture every screen."}
             },
             "required": ["text"]
         }
@@ -2146,6 +2147,10 @@ TOOL_DECLARATIONS = [
 ]
 
 
+class _VoiceChanged(Exception):
+    """Raised inside the live session to reconnect it with a newly chosen voice."""
+
+
 class BrahmaLive:
 
     def __init__(self, ui: BrahmaUI, dashboard=None, dashboard_started: bool = False, enable_dashboard: bool = True):
@@ -2622,9 +2627,9 @@ class BrahmaLive:
                 except Exception:
                     pass
 
+                # Screens are captured per monitor inside screen_process; the UI
+                # grab only covers the primary screen.
                 img_bytes = None
-                if vision_angle == "screen" and hasattr(self.ui, "capture_screen_bytes"):
-                    img_bytes = self.ui.capture_screen_bytes()
 
                 def _run_vision_process():
                     success = screen_process(
@@ -3818,11 +3823,9 @@ class BrahmaLive:
             except Exception:
                 pass
             print(f"[Main] {title_text} request received")
+            # Screens are captured per monitor inside screen_process; the UI
+            # grab only covers the primary screen.
             img_bytes = None
-            if vision_angle == "screen" and hasattr(self.ui, "capture_screen_bytes"):
-                print("[Main] Capturing screenshot from UI")
-                img_bytes = self.ui.capture_screen_bytes()
-                print(f"[Main] UI screenshot capture returned {len(img_bytes) if img_bytes is not None else 'None'} bytes")
 
             def _run_screen_process():
                 print("[Main] Starting vision_process thread")
@@ -5031,7 +5034,7 @@ class BrahmaLive:
             async def _send():
                 try:
                     prompt = (
-                        f"Deliver this update aloud to the user right now in your Charon voice. "
+                        f"Deliver this update aloud to the user right now in your own voice. "
                         f"Speak directly to the user as Brahma Evo without saying thank you or acknowledging this prompt:\n{text}"
                     )
                     content = types.Content(role="user", parts=[types.Part.from_text(text=prompt)])
@@ -5135,6 +5138,12 @@ class BrahmaLive:
     def _build_config(self) -> types.LiveConnectConfig:
         from datetime import datetime
 
+        voice = config_manager.get_voice_name()
+        if voice != getattr(self, "_active_voice", voice):
+            # Start fresh rather than resume, so the new voice is the one used.
+            self._resume_handle = None
+        self._active_voice = voice
+
         memory     = load_memory()
         mem_str    = format_memory_for_prompt(memory)
         sys_prompt = _load_system_prompt()
@@ -5202,7 +5211,7 @@ class BrahmaLive:
         parts.append(
             "CRITICAL PROTOCOL FOR SYSTEM ANNOUNCEMENTS & DIRECT SPEECH: "
             "When given an input asking you to deliver or speak an update, briefing, announcement, or direct speech to the user, "
-            "you MUST deliver the provided message aloud to the user in your natural Charon voice immediately and faithfully. "
+            "you MUST deliver the provided message aloud to the user in your natural voice immediately and faithfully. "
             "Never reply with 'Thank you for the briefing', never acknowledge the prompt, never add conversational filler like 'Okay, I got it', "
             "and do not call tools unless explicitly needed. Speak the update directly to the user as their AI assistant Brahma Evo."
         )
@@ -5229,11 +5238,18 @@ class BrahmaLive:
             speech_config=types.SpeechConfig(
                 voice_config=types.VoiceConfig(
                     prebuilt_voice_config=types.PrebuiltVoiceConfig(
-                        voice_name="Charon"
+                        voice_name=self._active_voice
                     )
                 )
             ),
         )
+
+    async def _watch_voice(self):
+        """End the session once the voice setting changes, so run() reconnects with it."""
+        while True:
+            await asyncio.sleep(1.0)
+            if config_manager.get_voice_name() != self._active_voice and not self._is_speaking:
+                raise _VoiceChanged()
 
     async def _execute_tool(self, fc) -> types.FunctionResponse:
         self._in_live_tool = True
@@ -6076,11 +6092,11 @@ class BrahmaLive:
                                     threading.Thread(target=_process_local_speech, args=(captured,), daemon=True).start()
 
                 if brahma_speaking:
-                    if self._echo.is_user_speech(indata, SEND_SAMPLE_RATE, lvl) and lvl > 28.0:
-                        loop.call_soon_threadsafe(self.trigger_barge_in)
-                        data = indata.tobytes()
-                    else:
-                        data = np.zeros_like(indata).tobytes()
+                    # Voice barge-in stays off (see core/echo.py): on open speakers the
+                    # guard mistakes our own voice for the user's, and every false
+                    # interrupt flushes the playback queue mid-word. To re-enable, call
+                    # self.trigger_barge_in when self._echo.is_user_speech(...) is True.
+                    data = np.zeros_like(indata).tobytes()
                 else:
                     if not self.ui.muted:
                         try:
@@ -6320,6 +6336,10 @@ class BrahmaLive:
                         tg.create_task(self._relay_phone_audio())
                         tg.create_task(self._receive_audio())
                         tg.create_task(self._play_audio())
+                        tg.create_task(self._watch_voice())
+                        if getattr(self, "_announce_voice", False):
+                            self._announce_voice = False
+                            self.speak("Voice changed. This is how I sound now, sir.")
                         if not self._startup_briefing_started:
                             self._startup_briefing_started = True
                             threading.Thread(
@@ -6346,12 +6366,17 @@ class BrahmaLive:
                         pass
                     
             except Exception as e:
+                self.session = None
+                self._loop = None
+                if isinstance(e, ExceptionGroup) and e.split(_VoiceChanged)[1] is None:
+                    print(f"[BRAHMA EVO] 🗣️ Voice changed to {config_manager.get_voice_name()}; reconnecting")
+                    self._announce_voice = True
+                    self.set_speaking(False)
+                    continue
                 print(f"[BRAHMA EVO] ⚠️ {e}")
                 traceback.print_exc()
                 if _is_gemini_limit_error(e):
                     self._use_openrouter_first = True
-                self.session = None
-                self._loop = None
             self.set_speaking(False)
             self.ui.set_state("LISTENING")
             print("[BRAHMA EVO] 🔄 Reconnecting in 5s...")
@@ -6509,6 +6534,11 @@ def main():
 
             # Morning greeting -> compile daily briefing and deliver via Charon voice
             elif alert_type == "morning_greeting":
+                # Shares the startup briefing's once-per-launch flag; otherwise a
+                # morning launch delivers the briefing twice.
+                if brahma_evo._startup_briefing_started:
+                    return
+                brahma_evo._startup_briefing_started = True
                 threading.Thread(
                     target=_speak_daily_briefing,
                     kwargs={"ui": brahma_evo.ui, "speak": brahma_evo.speak},

@@ -46,12 +46,12 @@ def test_screen_process_uses_provided_image_bytes(monkeypatch):
         called["capture"] = True
         return b"fallback"
 
-    def fake_analyze(image_bytes, mime_type, user_text):
-        assert image_bytes == b"provided"
-        assert mime_type == "image/jpeg"
+    def fake_analyze(images, user_text):
+        assert images == [(b"provided", "image/jpeg", None)]
         assert user_text == "look at my screen"
 
     monkeypatch.setattr(screen_processor, "_capture_screenshot", fake_capture_screenshot)
+    monkeypatch.setattr("core.window_context.get_foreground_window_info", lambda: None)
     monkeypatch.setattr(screen_processor._live, "analyze", fake_analyze)
     monkeypatch.setattr(screen_processor._live, "is_ready", lambda: True)
     monkeypatch.setattr(screen_processor, "_ensure_started", lambda player=None: None)

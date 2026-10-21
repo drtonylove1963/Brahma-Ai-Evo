@@ -37,9 +37,11 @@ CHANNELS            = 1
 RECEIVE_SAMPLE_RATE = 24000
 CHUNK_SIZE          = 1024
 
-IMG_MAX_W = 640
-IMG_MAX_H = 360
-JPEG_Q    = 55
+# Per image. Each monitor is sent as its own image, so a multi-screen desktop no
+# longer gets squeezed into one thumbnail where nothing is legible.
+IMG_MAX_W = 1600
+IMG_MAX_H = 900
+JPEG_Q    = 70
 
 SYSTEM_PROMPT = (
     "You are Brahma AI - Lite, an open-source assistant. "
@@ -145,6 +147,93 @@ def _capture_screenshot() -> bytes:
         return _to_jpeg(png_bytes)
 
 
+def _list_monitors(sct) -> list[dict]:
+    """Physical monitors, numbered left to right the way the user sees them."""
+    monitors = list(getattr(sct, "monitors", []) or [])[1:]   # [0] is the whole desktop
+    monitors = [m for m in monitors if m]
+    monitors.sort(key=lambda m: (m.get("left", 0), m.get("top", 0)))
+    return monitors
+
+
+def _monitor_label(number: int, monitor: dict, total: int) -> str:
+    label = f"Screen {number} of {total} ({monitor['width']}x{monitor['height']}"
+    if monitor.get("is_primary"):
+        label += ", primary"
+    return label + ")"
+
+
+_ORDINALS = {"first": 1, "1st": 1, "one": 1, "second": 2, "2nd": 2, "two": 2,
+             "third": 3, "3rd": 3, "three": 3, "fourth": 4, "4th": 4, "four": 4}
+
+
+def _parse_monitor(value, user_text: str, monitors: list[dict]) -> int | None:
+    """1-based monitor the user asked for, or None for every screen.
+
+    Accepts the tool's `monitor` argument (a number, or words like 'left',
+    'primary', 'all') and falls back to phrases in the request itself, such as
+    'my second screen' or 'monitor 2'."""
+    total = len(monitors)
+    if total <= 1:
+        return None
+
+    def _from_word(word: str) -> int | None:
+        word = word.strip().lower()
+        if word in ("", "all", "every", "both", "everything"):
+            return None
+        if word.isdigit():
+            n = int(word)
+            return n if 1 <= n <= total else None
+        if word in _ORDINALS:
+            n = _ORDINALS[word]
+            return n if n <= total else None
+        if word in ("left", "leftmost"):
+            return 1
+        if word in ("right", "rightmost", "last"):
+            return total
+        if word in ("middle", "center", "centre") and total >= 3:
+            return (total + 1) // 2
+        if word in ("primary", "main"):
+            for i, m in enumerate(monitors, 1):
+                if m.get("is_primary"):
+                    return i
+        return None
+
+    if value is not None and str(value).strip():
+        return _from_word(str(value))
+
+    text = (user_text or "").lower()
+    m = re.search(r"\b(?:screen|monitor|display)\s*#?\s*(\d)\b", text)
+    if m:
+        return _from_word(m.group(1))
+    words = "|".join(list(_ORDINALS) + ["left", "leftmost", "right", "rightmost",
+                                        "middle", "center", "centre", "primary", "main", r"\d"])
+    m = re.search(rf"\b({words})\s+(?:screen|monitor|display)\b", text)
+    if m:
+        return _from_word(m.group(1))
+    return None
+
+
+def _capture_monitors(monitor=None, user_text: str = "") -> list[tuple[bytes, str]]:
+    """Capture each monitor separately as (jpeg_bytes, label).
+
+    With several screens, one stitched image of the whole desktop shrinks every
+    screen to an unreadable strip, so each gets its own image and resolution
+    budget. A specific monitor can be requested by number or position."""
+    with mss.mss() as sct:
+        monitors = _list_monitors(sct)
+        if not monitors:
+            raise RuntimeError("No monitors were detected for screen capture.")
+        wanted = _parse_monitor(monitor, user_text, monitors)
+        chosen = [wanted] if wanted else range(1, len(monitors) + 1)
+        shots = []
+        for number in chosen:
+            mon = monitors[number - 1]
+            shot = sct.grab(mon)
+            png_bytes = mss.tools.to_png(shot.rgb, shot.size)
+            shots.append((_to_jpeg(png_bytes), _monitor_label(number, mon, len(monitors))))
+        return shots
+
+
 def _capture_camera() -> bytes:
     camera_index = _get_camera_index()
     cap = cv2.VideoCapture(camera_index, cv2.CAP_DSHOW)
@@ -242,19 +331,20 @@ class _LiveSession:
         while True:
             item = await self._out_queue.get()
             if self._session:
-                image_bytes, mime_type, user_text = item
+                images, user_text = item
                 try:
-                    b64 = base64.b64encode(image_bytes).decode("utf-8")
+                    parts = []
+                    for image_bytes, mime_type, label in images:
+                        if label:
+                            parts.append({"text": label + ":"})
+                        b64 = base64.b64encode(image_bytes).decode("utf-8")
+                        parts.append({"inline_data": {"mime_type": mime_type, "data": b64}})
+                    parts.append({"text": user_text})
                     await self._session.send_client_content(
-                        turns={
-                            "parts": [
-                                {"inline_data": {"mime_type": mime_type, "data": b64}},
-                                {"text": user_text}
-                            ]
-                        },
+                        turns={"parts": parts},
                         turn_complete=True
                     )
-                    print("[ScreenProcess] [OK] Image sent")
+                    print(f"[ScreenProcess] [OK] {len(images)} image(s) sent")
                 except Exception as e:
                     print(f"[ScreenProcess] [WARN] Send error: {e}")
                     if self._player and hasattr(self._player, "set_scanning"):
@@ -318,7 +408,8 @@ class _LiveSession:
             stream.stop()
             stream.close()
 
-    def analyze(self, image_bytes: bytes, mime_type: str, user_text: str):
+    def analyze(self, images: list[tuple[bytes, str, str | None]], user_text: str):
+        """Send (image_bytes, mime_type, label) images plus the question."""
         import time
         # Wait for the background thread to initialize the event loop
         for _ in range(50):
@@ -332,9 +423,10 @@ class _LiveSession:
         if not self._out_queue:
             print("[ScreenProcess] [ERR] Out queue is not initialized")
             return
-        print(f"[ScreenProcess] enqueueing payload: {len(image_bytes)} bytes, mime={mime_type}, text={user_text[:40]}")
+        total = sum(len(img) for img, _m, _l in images)
+        print(f"[ScreenProcess] enqueueing payload: {len(images)} image(s), {total} bytes, text={user_text[:40]}")
         asyncio.run_coroutine_threadsafe(
-            self._out_queue.put((image_bytes, mime_type, user_text)),
+            self._out_queue.put((images, user_text)),
             self._loop
         )
 
@@ -401,6 +493,7 @@ def screen_process(
     if player and hasattr(player, "set_scanning") and angle != "camera":
         player.set_scanning(True, "SCANNING SCREEN")
 
+    images = None   # set when several labelled screens are captured
     try:
         if angle == "camera":
             image_bytes = _capture_camera()
@@ -418,9 +511,11 @@ def screen_process(
                 mime_type = "image/jpeg"
                 print("[ScreenProcess] [SCREEN] Using pre-captured UI screenshot")
             else:
-                image_bytes = _capture_screenshot()
-                mime_type   = "image/jpeg" if _PIL_OK else "image/png"
-                print("[ScreenProcess] [SCREEN] Screen captured")
+                shots = _capture_monitors((parameters or {}).get("monitor"), user_text)
+                mime_type = "image/jpeg" if _PIL_OK else "image/png"
+                images = [(img, mime_type, label) for img, label in shots]
+                image_bytes = shots[0][0] if shots else None
+                print(f"[ScreenProcess] [SCREEN] Captured: {', '.join(l for _i, l in shots)}")
     except Exception as e:
         import traceback; traceback.print_exc()
         print(f"[ScreenProcess] [ERR] Capture error: {e}")
@@ -450,8 +545,13 @@ def screen_process(
         except Exception as we:
             print(f"[ScreenProcess] [WARN] Could not get foreground window context: {we}")
 
-    print(f"[ScreenProcess] [PKG] {len(image_bytes)} bytes → sending")
-    _live.analyze(image_bytes, mime_type, user_text)
+    if images is None:
+        images = [(image_bytes, mime_type, None)]
+    elif len(images) > 1:
+        user_text = (f"[The user has {len(images)} screens; each image above is labelled "
+                     f"with its screen number, counted left to right.]\n{user_text}")
+    print(f"[ScreenProcess] [PKG] {sum(len(i) for i, _m, _l in images)} bytes → sending")
+    _live.analyze(images, user_text)
     return True
 
 

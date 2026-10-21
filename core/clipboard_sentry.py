@@ -14,6 +14,17 @@ import json
 import re
 from typing import Optional, Callable
 
+# More than one sentry runs (main.py and ui.py each start one), and pyperclip's
+# Windows clipboard calls are not safe to overlap: concurrent reads corrupted the
+# heap and crashed the process (0xc0000374). Every read goes through this lock.
+_PASTE_LOCK = threading.Lock()
+
+
+def _read_clipboard() -> str:
+    import pyperclip
+    with _PASTE_LOCK:
+        return (pyperclip.paste() or "").strip()
+
 
 class ClipboardSentry:
     def __init__(self, callback: Optional[Callable[[str, str], None]] = None):
@@ -68,16 +79,15 @@ class ClipboardSentry:
         return None
 
     def _monitor_loop(self):
-        import pyperclip
         try:
-            self._last_clip = (pyperclip.paste() or "").strip()
+            self._last_clip = _read_clipboard()
         except Exception:
             self._last_clip = ""
 
         while self._running:
             time.sleep(1.2)
             try:
-                current = (pyperclip.paste() or "").strip()
+                current = _read_clipboard()
                 if current and current != self._last_clip:
                     self._last_clip = current
                     category = self._classify_content(current)

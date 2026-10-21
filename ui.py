@@ -12624,6 +12624,26 @@ class SystemConnectivityPage(QWidget):
         spk_row.addWidget(self._spk_combo, 1)
         alay.addLayout(spk_row)
 
+        # Voice selection row
+        voice_row = QHBoxLayout()
+        voice_lbl = QLabel("Assistant Voice")
+        voice_lbl.setStyleSheet(f"color: {C.WHITE}; min-width: 130px;")
+        voice_row.addWidget(voice_lbl)
+
+        self._voice_combo = QComboBox()
+        try:
+            from memory import config_manager
+            for name, character in config_manager.VOICE_OPTIONS.items():
+                self._voice_combo.addItem(f"{name} — {character}", name)
+            idx = self._voice_combo.findData(config_manager.get_voice_name())
+            if idx >= 0:
+                self._voice_combo.setCurrentIndex(idx)
+        except Exception:
+            pass
+        self._voice_combo.currentIndexChanged.connect(self._on_voice_changed)
+        voice_row.addWidget(self._voice_combo, 1)
+        alay.addLayout(voice_row)
+
         # Push-to-Talk and Memory Inspector Action buttons
         tools_row = QHBoxLayout()
         try:
@@ -12677,6 +12697,15 @@ class SystemConnectivityPage(QWidget):
             self._audio_status_lbl.setText(f"✅ Output device set to: {name}")
         except Exception as e:
             self._audio_status_lbl.setText(f"Error setting output: {e}")
+
+    def _on_voice_changed(self, _index: int):
+        try:
+            from memory import config_manager
+            name = self._voice_combo.currentData()
+            config_manager.set_voice_name(name)
+            self._audio_status_lbl.setText(f"✅ Voice set to: {name} (reconnecting voice session...)")
+        except Exception as e:
+            self._audio_status_lbl.setText(f"Error setting voice: {e}")
 
     def _on_ptt_toggled(self, checked: bool):
         try:

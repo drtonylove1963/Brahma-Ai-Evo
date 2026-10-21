@@ -80,6 +80,32 @@ def set_push_to_talk_enabled(enabled: bool) -> None:
     set_setting("push_to_talk_enabled", bool(enabled))
 
 
+# --- Voice
+# Gemini Live prebuilt voices, with Google's one-word character for each.
+
+DEFAULT_VOICE = "Charon"
+VOICE_OPTIONS = {
+    "Charon": "Informative", "Puck": "Upbeat", "Kore": "Firm", "Fenrir": "Excitable",
+    "Leda": "Youthful", "Orus": "Firm", "Aoede": "Breezy", "Zephyr": "Bright",
+    "Callirrhoe": "Easy-going", "Autonoe": "Bright", "Enceladus": "Breathy",
+    "Iapetus": "Clear", "Umbriel": "Easy-going", "Algieba": "Smooth", "Despina": "Smooth",
+    "Erinome": "Clear", "Algenib": "Gravelly", "Rasalgethi": "Informative",
+    "Laomedeia": "Upbeat", "Achernar": "Soft", "Alnilam": "Firm", "Schedar": "Even",
+    "Gacrux": "Mature", "Pulcherrima": "Forward", "Achird": "Friendly",
+    "Zubenelgenubi": "Casual", "Vindemiatrix": "Gentle", "Sadachbia": "Lively",
+    "Sadaltager": "Knowledgeable", "Sulafat": "Warm",
+}
+
+
+def get_voice_name() -> str:
+    name = str(get_setting("voice_name", DEFAULT_VOICE) or DEFAULT_VOICE)
+    return name if name in VOICE_OPTIONS else DEFAULT_VOICE
+
+
+def set_voice_name(name: str) -> None:
+    set_setting("voice_name", name if name in VOICE_OPTIONS else DEFAULT_VOICE)
+
+
 # --- Wake Word & Briefing
 
 def get_wake_word_enabled() -> bool:

@@ -99,7 +99,9 @@ def band_energies(pcm, sr: int) -> np.ndarray:
     Left unnormalised on purpose: the decision below projects one of these onto
     another, and a projection needs real magnitudes.
     """
-    x = np.asarray(pcm, dtype=np.float32)
+    # Flatten: sounddevice hands the mic callback (frames, channels) blocks, and
+    # a 2-D block broadcasts against the 1-D window below into a square matrix.
+    x = np.asarray(pcm, dtype=np.float32).ravel()
     if x.size < 64:
         return np.zeros(len(_BAND_EDGES) - 1, dtype=np.float32)
     x = x - x.mean()

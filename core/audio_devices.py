@@ -119,7 +119,7 @@ _probe_results: dict = {}
 def _transport_works(idx: int, kind: str, api_key) -> bool:
     """Does this host API actually move audio, or only pretend to?
 
-    Probed once per API per direction and cached. Output writes silence, so the
+    Probed once per device per direction and cached. Output writes silence, so the
     probe is inaudible; input reads and discards."""
     if api_key in _probe_results:
         return _probe_results[api_key]
@@ -302,8 +302,12 @@ def _query() -> dict[str, list[str]]:
                 found = _collect(api_filter, kind)
                 if not found:
                     continue
-                # One probe per API per direction, cached, on this thread.
-                if not _transport_works(found[0][0], kind, (api_filter, kind)):
+                # Probe devices in turn, cached per device, on this thread. The
+                # first device alone is not enough: a Bluetooth headset that is
+                # slow to start streaming would otherwise disqualify the whole
+                # API, and every working microphone on it with it.
+                if not any(_transport_works(i, kind, (api_filter, kind, i))
+                           for i, _n in found):
                     continue
                 _chosen_api[kind] = api_filter
                 out[kind] = [_display_name(n, devices) for _i, n in found]
