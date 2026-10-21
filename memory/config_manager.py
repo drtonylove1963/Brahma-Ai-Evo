@@ -80,6 +80,16 @@ def set_push_to_talk_enabled(enabled: bool) -> None:
     set_setting("push_to_talk_enabled", bool(enabled))
 
 
+# --- Voice barge-in (talk over Brahma to interrupt; best with a headset)
+
+def get_voice_barge_in_enabled() -> bool:
+    return bool(get_setting("voice_barge_in_enabled", True))
+
+
+def set_voice_barge_in_enabled(enabled: bool) -> None:
+    set_setting("voice_barge_in_enabled", bool(enabled))
+
+
 # --- Voice
 # Gemini Live prebuilt voices, with Google's one-word character for each.
 

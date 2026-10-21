@@ -129,6 +129,9 @@ SEND_SAMPLE_RATE    = 16000
 RECEIVE_SAMPLE_RATE = 24000
 CHUNK_SIZE          = 1024
 LIVE_CONNECT_TIMEOUT = 12
+# int16 RMS a mic block needs before it can count as the user talking over Brahma
+# (~-40 dBFS: above headset hiss and breathing, well below normal speech).
+_BARGE_MIN_LEVEL    = 320.0
 _SINGLE_INSTANCE_MUTEX = None
 
 
@@ -2204,6 +2207,18 @@ class BrahmaLive:
         except Exception:
             self._ptt_enabled = False
 
+        # Interrupting a reply. _turn_open is True while Gemini is still
+        # generating; _drop_reply discards the rest of a turn the user cut off.
+        self._turn_open = False
+        self._drop_reply = False
+        self._barge_run = 0
+        try:
+            self._voice_barge_in = config_manager.get_voice_barge_in_enabled()
+        except Exception:
+            self._voice_barge_in = False
+        self._stop_key = PushToTalk(self._on_stop_key, chord=("esc",))
+        self._stop_key.start()
+
         try:
             audio_devices.configure(SEND_SAMPLE_RATE, RECEIVE_SAMPLE_RATE)
             audio_devices.prefetch()
@@ -2242,6 +2257,12 @@ class BrahmaLive:
 
     def _on_ptt(self, held: bool) -> None:
         self._ptt_held = held
+        if held:
+            self.trigger_barge_in()
+
+    def _on_stop_key(self, held: bool) -> None:
+        if held:
+            self.trigger_barge_in()
 
     def _reset_idle_activity(self):
         self._last_activity = time.monotonic()
@@ -4997,26 +5018,33 @@ class BrahmaLive:
             if not self._is_speaking:
                 return
             self._is_speaking = False
+            # Gemini streams faster than we play, so it may still be generating.
+            # Discard the rest of this turn, or the receive loop replays it.
+            self._drop_reply = self._turn_open
+        self._barge_run = 0
 
-        try:
-            from actions.attention_monitor import stop_native_speech
-            stop_native_speech()
-        except Exception:
-            pass
+        def _stop_native():
+            try:
+                from actions.attention_monitor import stop_native_speech
+                stop_native_speech()
+            except Exception:
+                pass
 
-        try:
-            if self.audio_in_queue:
-                while not self.audio_in_queue.empty():
-                    try:
-                        self.audio_in_queue.get_nowait()
-                    except Exception:
-                        break
-        except Exception:
-            pass
+        # Keep MCI/process calls off the audio callback thread.
+        threading.Thread(target=_stop_native, daemon=True).start()
 
+        def _flush():
+            q = self.audio_in_queue
+            while q is not None and not q.empty():
+                try:
+                    q.get_nowait()
+                except Exception:
+                    break
+
+        # Called from the hotkey and mic threads; asyncio.Queue is loop-only.
         try:
-            from sound_manager import SoundManager
-            SoundManager.instance().play_listening_start()
+            if self._loop is not None:
+                self._loop.call_soon_threadsafe(_flush)
         except Exception:
             pass
 
@@ -5211,6 +5239,12 @@ class BrahmaLive:
             "and wait for the user's next command. "
             "IMPORTANT: Do NOT speak an unprompted generic greeting (like 'Thank you, how can I help you?') upon connecting. "
             "Remain completely silent until the user speaks to you or asks a question."
+        )
+        parts.append(
+            "SPOKEN LENGTH: Your replies are heard, not read. Keep each spoken answer to one to three short sentences "
+            "unless the user asks for detail, a list, or a step-by-step walkthrough. Lead with the answer, skip preamble "
+            "and recaps, and offer to go deeper instead of going deeper unasked. If the user interrupts you, stop the "
+            "previous thought and respond to what they just said."
         )
         parts.append(
             "CRITICAL PROTOCOL FOR SYSTEM ANNOUNCEMENTS & DIRECT SPEECH: "
@@ -6096,11 +6130,24 @@ class BrahmaLive:
                                     threading.Thread(target=_process_local_speech, args=(captured,), daemon=True).start()
 
                 if brahma_speaking:
-                    # Voice barge-in stays off (see core/echo.py): on open speakers the
-                    # guard mistakes our own voice for the user's, and every false
-                    # interrupt flushes the playback queue mid-word. To re-enable, call
-                    # self.trigger_barge_in when self._echo.is_user_speech(...) is True.
-                    data = np.zeros_like(indata).tobytes()
+                    # Holding push-to-talk is a deliberate interrupt. Otherwise
+                    # interrupt by voice once the guard has heard a sustained voice
+                    # that isn't our own echo. Quiet blocks are passed as level 0 so
+                    # the guard learns "no echo here" (headset) rather than learning
+                    # room noise as echo and going deaf.
+                    barge = getattr(self, "_ptt_held", False)
+                    if not barge and self._voice_barge_in and not self.ui.muted:
+                        guard_lvl = lvl if lvl >= _BARGE_MIN_LEVEL else 0.0
+                        if self._echo.is_user_speech(indata, SEND_SAMPLE_RATE, guard_lvl):
+                            self._barge_run += 1
+                        else:
+                            self._barge_run = 0
+                        barge = self._barge_run >= self._echo.required_blocks
+                    if barge:
+                        self.trigger_barge_in()
+                        data = indata.tobytes()
+                    else:
+                        data = np.zeros_like(indata).tobytes()
                 else:
                     if not self.ui.muted:
                         try:
@@ -6108,7 +6155,15 @@ class BrahmaLive:
                         except Exception:
                             pass
                     # If EchoGuard detects residual acoustic echo from recent output, drop it
-                    if self._echo._hist and not self._echo.is_user_speech(indata, SEND_SAMPLE_RATE, lvl):
+                    # Quiet blocks only teach the guard (as silence); its verdict
+                    # on them is ignored so soft speech still reaches Gemini.
+                    echo = False
+                    if self._echo._hist:
+                        if lvl >= _BARGE_MIN_LEVEL:
+                            echo = not self._echo.is_user_speech(indata, SEND_SAMPLE_RATE, lvl)
+                        elif self._echo.active:
+                            self._echo.is_user_speech(indata, SEND_SAMPLE_RATE, 0.0)
+                    if echo:
                         data = np.zeros_like(indata).tobytes()
                     elif lvl > 10.0:
                         data = indata.tobytes()
@@ -6149,8 +6204,10 @@ class BrahmaLive:
                             self._resume_handle = _sru.new_handle
 
                     if response.data:
-                        self.set_speaking(True)
-                        self.audio_in_queue.put_nowait(response.data)
+                        self._turn_open = True
+                        if not self._drop_reply:
+                            self.set_speaking(True)
+                            self.audio_in_queue.put_nowait(response.data)
 
                     if response.server_content:
                         sc = response.server_content
@@ -6182,6 +6239,13 @@ class BrahmaLive:
                                         self.ui.write_log("SYS: Wake word detected. Mic active.")
                                     except Exception:
                                         pass
+
+                        if getattr(sc, "interrupted", False):
+                            # Gemini heard the user talk over it: stop playing what's queued.
+                            self.trigger_barge_in()
+                        if sc.turn_complete or getattr(sc, "interrupted", False):
+                            self._turn_open = False
+                            self._drop_reply = False
 
                         if sc.turn_complete:
                             # Note: self.set_speaking(False) is managed by _play_audio once speaker output finishes draining
@@ -6325,6 +6389,8 @@ class BrahmaLive:
                         self._loop          = asyncio.get_event_loop()
                         self.audio_in_queue = asyncio.Queue()
                         self.out_queue      = asyncio.Queue()  # Fix: removed maxsize=10 to prevent dropping packets
+                        self._turn_open     = False
+                        self._drop_reply    = False
                         
                         print("[BRAHMA EVO] ✅ Connected.")
                         try:

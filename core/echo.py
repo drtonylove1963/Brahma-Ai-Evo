@@ -175,6 +175,11 @@ class EchoGuard:
         """1.0 = fully explained by our own output, 0.0 = nothing to do with it."""
         return self._last_sim
 
+    @property
+    def active(self) -> bool:
+        """True while recent output could still be coming back as echo."""
+        return bool(self._hist) and time.monotonic() - self._hist[-1][0] <= _HISTORY_S
+
     def reset(self) -> None:
         """Playback stopped — drop the history, keep what was learned."""
         self._hist.clear()
