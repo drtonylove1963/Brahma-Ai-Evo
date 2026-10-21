@@ -88,6 +88,7 @@ from actions.game_updater      import game_updater
 from actions.attention_monitor import AttentionMonitor, speak_native, stop_native_speech, handle_call_action, read_event_preview, set_speech_sink
 # from actions.daily_briefing import compile_daily_briefing
 from llm_client import client as openrouter_client
+from or_client import allow_paid_fallback, set_paid_approver
 from workspace_store import store as workspace_store
 from smart_home.service import SmartHomeService
 from plugin_manager import PluginManager
@@ -4406,10 +4407,11 @@ class BrahmaLive:
             return _gemini_text_reply(prompt) or user_text
         except Exception:
             try:
-                return openrouter_client.chat(
-                    prompt,
-                    system="You are a friendly assistant. Rewrite the reply naturally and humanely.",
-                )
+                with allow_paid_fallback():
+                    return openrouter_client.chat(
+                        prompt,
+                        system="You are a friendly assistant. Rewrite the reply naturally and humanely.",
+                    )
             except Exception:
                 return user_text
 
@@ -4820,13 +4822,14 @@ class BrahmaLive:
                         output="Processing on OpenRouter...",
                         percent=50,
                     )
-                    reply = openrouter_client.chat(
-                        request_text,
-                        system=(
-                            "You are Brahma Evo, a concise, helpful desktop assistant. "
-                            "Reply naturally and briefly. Do not mention internal implementation details."
-                        ),
-                    )
+                    with allow_paid_fallback():
+                        reply = openrouter_client.chat(
+                            request_text,
+                            system=(
+                                "You are Brahma Evo, a concise, helpful desktop assistant. "
+                                "Reply naturally and briefly. Do not mention internal implementation details."
+                            ),
+                        )
                     print("[BRAHMA EVO] 🌐 OpenRouter answered successfully!")
                 except Exception as e_or:
                     print(f"[BRAHMA EVO] ⚠️ OpenRouter failed: {e_or}")
@@ -4921,7 +4924,8 @@ class BrahmaLive:
             if not reply and not is_offline_mode:
                 if is_cloud_gemini and self._use_openrouter_first:
                     try:
-                        reply = openrouter_client.chat(request_text)
+                        with allow_paid_fallback():
+                            reply = openrouter_client.chat(request_text)
                     except Exception:
                         pass
                 elif is_cloud_openrouter:
@@ -6406,6 +6410,7 @@ def main():
         _startup_log(f"GitHub update skipped: {exc}")
     _ensure_desktop_shortcut()
     ui = BrahmaUI(str(BASE_DIR / "assets" / "Brahma_Lite_Logo.png"), show_immediately=True)
+    set_paid_approver(ui.ask_paid_approval)
     dashboard = None
     dashboard_enabled = DashboardServer is not None and not _is_port_in_use(8000)
     if DashboardServer is not None and not dashboard_enabled:

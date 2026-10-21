@@ -9484,6 +9484,7 @@ class MainWindow(QMainWindow):
     _meeting_sig = pyqtSignal(object)
     _task_workspace_sig = pyqtSignal(object)
     _screen_capture_sig = pyqtSignal()
+    _paid_approval_sig = pyqtSignal(object)
     discord_config_changed = pyqtSignal(object)
     discord_status_changed = pyqtSignal(str)
     minimized = pyqtSignal()
@@ -9656,6 +9657,7 @@ class MainWindow(QMainWindow):
         self._task_workspace_sig.connect(self._apply_task_workspace)
         self._scan_sig.connect(self._apply_scan_state)
         self._screen_capture_sig.connect(self._on_screen_capture_requested)
+        self._paid_approval_sig.connect(self._on_paid_approval_requested)
         self.discord_status_changed.connect(self._on_discord_status_update)
         self._hud_operation_sig.connect(self._apply_hud_operation)
         self._hud_deliverable_sig.connect(self._apply_hud_deliverable)
@@ -10968,6 +10970,48 @@ class MainWindow(QMainWindow):
             self._screen_capture_result = b""
         finally:
             self._screen_capture_event.set()
+
+    def _on_paid_approval_requested(self, request: dict):
+        """Ask before a paid AI model is used. Unanswered requests are denied."""
+        from PyQt6.QtCore import QTimer
+
+        box = QMessageBox(self)
+        box.setWindowTitle("Approve paid AI model?")
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setText(
+            "All free AI models are unavailable right now.\n\n"
+            f"Use the paid model {request['model']} for this request?\n"
+            f"Estimated cost: {request['cost']}"
+        )
+        box.setInformativeText(f"No answer within {request['timeout']} seconds counts as Deny.")
+        once_btn = box.addButton("Approve once", QMessageBox.ButtonRole.AcceptRole)
+        session_btn = box.addButton("Approve for this session", QMessageBox.ButtonRole.AcceptRole)
+        deny_btn = box.addButton("Deny", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(deny_btn)
+        box.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
+
+        def _finish(answer: str):
+            if not request["event"].is_set():
+                request["answer"] = answer
+                request["event"].set()
+
+        def _clicked(button):
+            _finish({once_btn: "once", session_btn: "session"}.get(button, "deny"))
+
+        box.buttonClicked.connect(_clicked)
+        box.finished.connect(lambda _r: _finish("deny"))
+        QTimer.singleShot(request["timeout"] * 1000, box.reject)
+        box.show()
+        box.raise_()
+        box.activateWindow()
+
+    def ask_paid_approval_threadsafe(self, model: str, cost: str, timeout: int = 30) -> str:
+        """Block a worker thread until the user answers; returns once/session/deny."""
+        request = {"model": model, "cost": cost, "timeout": timeout,
+                   "event": threading.Event(), "answer": "deny"}
+        self._paid_approval_sig.emit(request)
+        request["event"].wait(timeout + 5)
+        return request["answer"]
 
     def capture_screen_threadsafe(self) -> bytes:
         print("[UI] capture_screen_threadsafe started")
@@ -16275,6 +16319,12 @@ class BrahmaUI:
             "plan": plan or [],
             "source": source or "local",
         })
+
+    def ask_paid_approval(self, model: str, cost: str) -> str:
+        """Ask the user before a paid model is used; returns once/session/deny."""
+        if threading.current_thread() is threading.main_thread():
+            return "deny"   # waiting here would block the dialog it is waiting for
+        return self._win.ask_paid_approval_threadsafe(model, cost)
 
     def capture_screen_bytes(self) -> bytes:
         import threading

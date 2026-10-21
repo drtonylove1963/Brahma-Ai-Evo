@@ -4,8 +4,10 @@ import sys
 import time
 import base64
 import logging
+import contextvars
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 import requests
 
@@ -63,6 +65,57 @@ RATE_LIMIT_COOLDOWN   = 60   # seconds before retrying a rate-limited model
 
 _rate_limited: dict[str, float] = {}
 
+# ── Paid fallback ────────────────────────────────────────────────────────────
+# Used only when every free model has failed, only for requests the user made
+# themselves (wrapped in allow_paid_fallback()), and only after the user
+# approves. Background jobs never reach it. Requests carry data_collection=deny
+# so no provider that trains on prompts is ever chosen.
+PAID_FALLBACK_MODEL = "google/gemini-2.5-flash"
+_PAID_USD_PER_INPUT_TOKEN  = 0.30 / 1_000_000
+_PAID_USD_PER_OUTPUT_TOKEN = 2.50 / 1_000_000
+_TYPICAL_OUTPUT_TOKENS     = 600
+_TOKENS_PER_IMAGE          = 258
+
+_paid_allowed = contextvars.ContextVar("openrouter_paid_allowed", default=False)
+# Called as approver(model, cost_text) and returns "once", "session" or "deny".
+_paid_approver: Optional[Callable[[str, str], str]] = None
+_paid_session_approved = False
+
+
+def set_paid_approver(approver: Optional[Callable[[str, str], str]]) -> None:
+    """Register the function that asks the user before a paid model is used."""
+    global _paid_approver
+    _paid_approver = approver
+
+
+@contextmanager
+def allow_paid_fallback():
+    """Mark OpenRouter calls inside this block as user-initiated, so the paid
+    fallback may be offered (with approval) if every free model fails."""
+    token = _paid_allowed.set(True)
+    try:
+        yield
+    finally:
+        _paid_allowed.reset(token)
+
+
+def _estimate_paid_cost(messages: list[dict], max_tokens: int) -> str:
+    chars, images = 0, 0
+    for msg in messages:
+        content = msg.get("content", "")
+        if isinstance(content, str):
+            chars += len(content)
+            continue
+        for part in content or []:
+            if part.get("type") == "text":
+                chars += len(part.get("text", ""))
+            else:
+                images += 1
+    input_cost = (chars // 4 + images * _TOKENS_PER_IMAGE) * _PAID_USD_PER_INPUT_TOKEN
+    typical = input_cost + min(max_tokens, _TYPICAL_OUTPUT_TOKENS) * _PAID_USD_PER_OUTPUT_TOKEN
+    ceiling = input_cost + max_tokens * _PAID_USD_PER_OUTPUT_TOKEN
+    return f"about ${typical:.4f} (at most ${ceiling:.4f})"
+
 class OpenRouterClient:
 
     def __init__(self) -> None:
@@ -97,6 +150,7 @@ class OpenRouterClient:
         max_tokens: int = DEFAULT_MAX_TOKENS,
         temperature: float = DEFAULT_TEMPERATURE,
         response_format: Optional[dict] = None,
+        provider: Optional[dict] = None,
     ) -> Optional[str]:
         payload: dict = {
             "model":       model,
@@ -106,6 +160,8 @@ class OpenRouterClient:
         }
         if response_format:
             payload["response_format"] = response_format
+        if provider:
+            payload["provider"] = provider
 
         if not self.api_key:
             raise PermissionError(
@@ -144,6 +200,9 @@ class OpenRouterClient:
                             .get("message", {})
                             .get("content", "")
                     )
+                    cost = (data.get("usage") or {}).get("cost")
+                    if cost:
+                        logger.info(f"[OpenRouter] {model} cost ${cost:.6f}")
                     return content.strip() if content else None
 
                 logger.warning(
@@ -194,9 +253,40 @@ class OpenRouterClient:
                 logger.info(f"[OpenRouter] ✓ Success: {m}")
                 return result
 
+        result = self._try_paid_fallback(messages, max_tokens, temperature, response_format)
+        if result:
+            return result
+
         raise RuntimeError(
             "[OpenRouter] All models failed or are rate-limited. "
             "Check your API key and network connection."
+        )
+
+    def _try_paid_fallback(
+        self,
+        messages: list[dict],
+        max_tokens: int,
+        temperature: float,
+        response_format: Optional[dict],
+    ) -> Optional[str]:
+        global _paid_session_approved
+        if not _paid_allowed.get() or _paid_approver is None:
+            return None
+        if not _paid_session_approved:
+            try:
+                decision = _paid_approver(PAID_FALLBACK_MODEL, _estimate_paid_cost(messages, max_tokens))
+            except Exception as e:
+                logger.warning(f"[OpenRouter] Paid approval prompt failed: {e}")
+                return None
+            if decision == "session":
+                _paid_session_approved = True
+            elif decision != "once":
+                logger.info("[OpenRouter] Paid fallback declined")
+                return None
+        logger.info(f"[OpenRouter] Trying paid fallback: {PAID_FALLBACK_MODEL}")
+        return self._call(
+            PAID_FALLBACK_MODEL, messages, max_tokens, temperature, response_format,
+            provider={"data_collection": "deny"},
         )
 
     def chat(
