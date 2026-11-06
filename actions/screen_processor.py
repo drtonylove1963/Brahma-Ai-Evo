@@ -213,12 +213,39 @@ def _parse_monitor(value, user_text: str, monitors: list[dict]) -> int | None:
     return None
 
 
-def _capture_monitors(monitor=None, user_text: str = "") -> list[tuple[bytes, str]]:
+HIRES_TILE_W = 2560   # widest slice sent at native resolution in hi-res mode
+HIRES_JPEG_Q = 85
+
+
+def _hires_tiles(png_bytes: bytes, label: str) -> list[tuple[bytes, str]]:
+    """Split a screen into native-resolution slices no wider than HIRES_TILE_W.
+
+    A 5120x1440 ultrawide shrunk to 1600 px leaves window text at ~30% size,
+    which the vision model can't read and then guesses at."""
+    img = PIL.Image.open(io.BytesIO(png_bytes)).convert("RGB")
+    w, h = img.size
+    n = max(1, -(-w // HIRES_TILE_W))   # ceil
+    names = {2: ["left half", "right half"], 3: ["left third", "middle third", "right third"]}
+    tiles = []
+    for i in range(n):
+        box = (w * i // n, 0, w * (i + 1) // n, h)
+        part = img.crop(box)
+        if part.height > 1600:
+            part.thumbnail([HIRES_TILE_W, 1600], getattr(PIL.Image, "Resampling", PIL.Image).LANCZOS)
+        buf = io.BytesIO()
+        part.save(buf, format="JPEG", quality=HIRES_JPEG_Q, optimize=False)
+        tag = label if n == 1 else f"{label}, {names.get(n, [f'part {k+1} of {n}' for k in range(n)])[i]}"
+        tiles.append((buf.getvalue(), tag))
+    return tiles
+
+
+def _capture_monitors(monitor=None, user_text: str = "", hires: bool = False) -> list[tuple[bytes, str]]:
     """Capture each monitor separately as (jpeg_bytes, label).
 
     With several screens, one stitched image of the whole desktop shrinks every
     screen to an unreadable strip, so each gets its own image and resolution
-    budget. A specific monitor can be requested by number or position."""
+    budget. A specific monitor can be requested by number or position.
+    hires=True keeps native resolution, slicing very wide screens."""
     with mss.mss() as sct:
         monitors = _list_monitors(sct)
         if not monitors:
@@ -230,7 +257,11 @@ def _capture_monitors(monitor=None, user_text: str = "") -> list[tuple[bytes, st
             mon = monitors[number - 1]
             shot = sct.grab(mon)
             png_bytes = mss.tools.to_png(shot.rgb, shot.size)
-            shots.append((_to_jpeg(png_bytes), _monitor_label(number, mon, len(monitors))))
+            label = _monitor_label(number, mon, len(monitors))
+            if hires and _PIL_OK:
+                shots.extend(_hires_tiles(png_bytes, label))
+            else:
+                shots.append((_to_jpeg(png_bytes), label))
         return shots
 
 
@@ -490,10 +521,31 @@ def screen_process(
         print(msg)
         return _screen_failure("Vision module failed to initialize. Check your internet connection and API key.")
 
+    images, user_text = _capture(parameters, user_text, angle, player, image_bytes)
+    if images is None:
+        return _screen_failure(user_text)
+
+    if not _live.is_ready():
+        print("[ScreenProcess] [ERR] Vision module is not ready to send image.")
+        return _screen_failure("Vision module is offline. It may still be reconnecting.")
+
+    print(f"[ScreenProcess] [PKG] {sum(len(i) for i, _m, _l in images)} bytes → sending")
+    _live.analyze(images, user_text)
+    return True
+
+
+def _capture(parameters: dict, user_text: str, angle: str, player=None,
+             image_bytes: bytes | None = None, hires: bool = False):
+    """Capture the requested view.
+
+    Returns (images, user_text) where images is a list of (bytes, mime, label),
+    or (None, error_message) on failure.
+    """
     if player and hasattr(player, "set_scanning") and angle != "camera":
         player.set_scanning(True, "SCANNING SCREEN")
 
     images = None   # set when several labelled screens are captured
+    mime_type = "image/jpeg"
     try:
         if angle == "camera":
             image_bytes = _capture_camera()
@@ -511,7 +563,7 @@ def screen_process(
                 mime_type = "image/jpeg"
                 print("[ScreenProcess] [SCREEN] Using pre-captured UI screenshot")
             else:
-                shots = _capture_monitors((parameters or {}).get("monitor"), user_text)
+                shots = _capture_monitors((parameters or {}).get("monitor"), user_text, hires=hires)
                 mime_type = "image/jpeg" if _PIL_OK else "image/png"
                 images = [(img, mime_type, label) for img, label in shots]
                 image_bytes = shots[0][0] if shots else None
@@ -519,15 +571,11 @@ def screen_process(
     except Exception as e:
         import traceback; traceback.print_exc()
         print(f"[ScreenProcess] [ERR] Capture error: {e}")
-        return _screen_failure("Failed to capture the screen. Please ensure the application has permission to capture your display.")
+        return None, "Failed to capture the screen. Please ensure the application has permission to capture your display."
 
     if not image_bytes:
         print("[ScreenProcess] [ERR] No image bytes available for analysis.")
-        return _screen_failure("Screen capture returned empty data. Try again or restart the app.")
-
-    if not _live.is_ready():
-        print("[ScreenProcess] [ERR] Vision module is not ready to send image.")
-        return _screen_failure("Vision module is offline. It may still be reconnecting.")
+        return None, "Screen capture returned empty data. Try again or restart the app."
 
     # Enrich prompt with foreground window context if available
     if angle != "camera":
@@ -550,9 +598,78 @@ def screen_process(
     elif len(images) > 1:
         user_text = (f"[The user has {len(images)} screens; each image above is labelled "
                      f"with its screen number, counted left to right.]\n{user_text}")
-    print(f"[ScreenProcess] [PKG] {sum(len(i) for i, _m, _l in images)} bytes → sending")
-    _live.analyze(images, user_text)
-    return True
+    return images, user_text
+
+
+# Tried in order. gemini-2.5-flash can't read window text at this size and makes
+# it up; the 3.x flash models read it verbatim (~5s vs ~1.5s).
+DESCRIBE_MODELS = ("gemini-3.8-flash", "gemini-3.5-flash", "gemini-2.5-flash")
+DESCRIBE_PROMPT = (
+    "You are the eyes of a voice assistant. Look at the image(s) and answer the user's "
+    "question about them. Be specific: quote the exact text, names, numbers or errors you "
+    "can read. Keep it to what answers the question, in at most three short sentences. "
+    "Only report text you can actually read in the image. Names or topics mentioned in "
+    "the question are not evidence; if the window the user means isn't visible or its "
+    "text is unreadable, say so instead of guessing. "
+    "Plain text only — the assistant will say it aloud in its own words."
+)
+
+
+def screen_describe(parameters: dict, player=None) -> str:
+    """Capture and analyse, returning the answer as text instead of speaking it.
+
+    Used by the main Live session's tool call, so the reply is spoken once, in the
+    user's chosen voice, and can be interrupted like any other reply. The older
+    screen_process path speaks through a second Live session, which made two
+    voices answer at once.
+    """
+    user_text = ((parameters or {}).get("text") or (parameters or {}).get("user_text", "") or "").strip()
+    if not user_text:
+        user_text = "What is on the screen?"
+    angle = ((parameters or {}).get("angle") or "screen").lower().strip()
+    print(f"[ScreenProcess] describe angle={angle!r}  text={user_text!r}")
+    try:
+        images, user_text = _capture(parameters, user_text, angle, player, hires=True)
+        if images is None:
+            return f"Screen analysis failed: {user_text}"
+        parts = []
+        for img, mime_type, label in images:
+            if label:
+                parts.append(types.Part.from_text(text=label + ":"))
+            parts.append(types.Part.from_bytes(data=img, mime_type=mime_type))
+        parts.append(types.Part.from_text(text=user_text))
+        # v1 rejects system_instruction ("Developer instruction is not enabled").
+        client = genai.Client(api_key=_get_api_key(), http_options={"api_version": "v1beta"})
+        resp, last_err = None, None
+        for model in DESCRIBE_MODELS:
+            kw = {"system_instruction": DESCRIBE_PROMPT}
+            if model.startswith("gemini-2.5"):
+                kw["thinking_config"] = types.ThinkingConfig(thinking_budget=0)
+            try:
+                resp = client.models.generate_content(
+                    model=model,
+                    contents=[types.Content(role="user", parts=parts)],
+                    config=types.GenerateContentConfig(**kw),
+                )
+                print(f"[ScreenProcess] describe model={model}")
+                break
+            except Exception as e:
+                last_err = e
+                print(f"[ScreenProcess] [WARN] {model} failed: {e}")
+        if resp is None:
+            raise last_err
+        text = (resp.text or "").strip()
+        print(f"[ScreenProcess] [MSG] {text}")
+        return text or "Screen analysis returned nothing."
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        return f"Screen analysis failed: {e}"
+    finally:
+        if player and hasattr(player, "set_scanning") and angle != "camera":
+            try:
+                player.set_scanning(False, "")
+            except Exception:
+                pass
 
 
 def warmup_session(player=None):

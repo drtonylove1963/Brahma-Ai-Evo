@@ -65,7 +65,7 @@ from actions.weather_report    import weather_action
 from actions.send_message      import send_message
 from actions.reminder          import reminder
 from actions.computer_settings import computer_settings
-from actions.screen_processor  import screen_process
+from actions.screen_processor  import screen_process, screen_describe
 from actions.meeting_assistant import MeetingAssistant
 from actions.youtube_video     import youtube_video
 from actions.desktop           import desktop_control
@@ -1110,7 +1110,8 @@ TOOL_DECLARATIONS = [
             "MUST be called when user asks what is on screen, what you see, "
             "analyze my screen, look at camera, etc. "
             "You have NO visual ability without this tool. "
-            "After calling this tool, stay SILENT — the vision module speaks directly."
+            "It returns a text description of what it sees; answer the user from it "
+            "in your own words, briefly. Don't guess at screen contents before it returns."
         ),
         "parameters": {
             "type": "OBJECT",
@@ -5660,19 +5661,11 @@ class BrahmaLive:
                 result = r or "PDF created."
 
             elif name == "screen_process":
-                if hasattr(self, "set_scanning"):
-                    self.ui.set_scanning(True, "SCANNING SCREEN")
-                threading.Thread(
-                    target=screen_process,
-                    kwargs={
-                        "parameters": args,
-                        "response": None,
-                        "player": self.ui,
-                        "session_memory": None,
-                    },
-                    daemon=True,
-                ).start()
-                result = "Vision module activated. Stay completely silent — vision module will speak directly."
+                # Analyse to text and let this session say it: the old path spoke
+                # through a second Live session, so two voices answered at once.
+                result = await loop.run_in_executor(
+                    None, lambda: screen_describe(args, player=self.ui)
+                )
 
             elif name == "computer_settings":
                 r = await loop.run_in_executor(None, lambda: computer_settings(parameters=args, response=None, player=self.ui))
