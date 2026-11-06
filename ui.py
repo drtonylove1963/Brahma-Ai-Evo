@@ -12617,6 +12617,8 @@ class SystemConnectivityPage(QWidget):
         except Exception:
             pass
 
+        lay.addWidget(self._build_persona_card())
+
         # Brahma Audio Routing & Hardware Controls
         audio_card = self._card("Audio Routing & Hardware Controls", "Select hardware audio interfaces, toggle Push-to-Talk, or inspect long-term memory.")
         alay = audio_card.layout()
@@ -12723,6 +12725,186 @@ class SystemConnectivityPage(QWidget):
         lay.addStretch(1)
         return col
 
+
+    # ── Personas: saved name + voice + personality profiles ─────────────────
+
+    def _build_persona_card(self):
+        card = self._card(
+            "Personas",
+            "Save a name, voice and personality as a profile, then switch whenever you like. "
+            "The active persona is who answers you. You can also say \"switch to <name>\".",
+        )
+        play = card.layout()
+        lbl_css = f"color: {C.WHITE}; min-width: 130px;"
+        field_css = (f"background: rgba(255,255,255,0.04); color: {C.WHITE}; "
+                     f"border: 1px solid rgba(0,229,255,0.25); border-radius: 6px; padding: 4px 6px;")
+
+        pick_row = QHBoxLayout()
+        pick_lbl = QLabel("Saved persona")
+        pick_lbl.setStyleSheet(lbl_css)
+        pick_row.addWidget(pick_lbl)
+        self._persona_combo = QComboBox()
+        self._persona_combo.currentIndexChanged.connect(self._on_persona_picked)
+        pick_row.addWidget(self._persona_combo, 1)
+        switch_btn = QPushButton("Switch to this persona")
+        switch_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        switch_btn.clicked.connect(self._on_persona_switch)
+        pick_row.addWidget(switch_btn)
+        del_btn = QPushButton("Delete")
+        del_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        del_btn.clicked.connect(self._on_persona_delete)
+        pick_row.addWidget(del_btn)
+        play.addLayout(pick_row)
+
+        name_row = QHBoxLayout()
+        name_lbl = QLabel("Name")
+        name_lbl.setStyleSheet(lbl_css)
+        name_row.addWidget(name_lbl)
+        self._persona_name = QLineEdit()
+        self._persona_name.setPlaceholderText("What the assistant calls itself, e.g. Athena")
+        self._persona_name.setStyleSheet(field_css)
+        name_row.addWidget(self._persona_name, 1)
+        play.addLayout(name_row)
+
+        voice_row = QHBoxLayout()
+        voice_lbl = QLabel("Voice")
+        voice_lbl.setStyleSheet(lbl_css)
+        voice_row.addWidget(voice_lbl)
+        self._persona_voice = QComboBox()
+        try:
+            from memory import config_manager
+            for vname, character in config_manager.VOICE_OPTIONS.items():
+                self._persona_voice.addItem(f"{vname} — {character}", vname)
+        except Exception:
+            pass
+        voice_row.addWidget(self._persona_voice, 1)
+        play.addLayout(voice_row)
+
+        notes_lbl = QLabel("Personality (optional)")
+        notes_lbl.setStyleSheet(lbl_css)
+        play.addWidget(notes_lbl)
+        self._persona_notes = QTextEdit()
+        self._persona_notes.setPlaceholderText("e.g. Warm and witty. Keep answers short. Call me T.")
+        self._persona_notes.setFixedHeight(70)
+        self._persona_notes.setStyleSheet(field_css)
+        play.addWidget(self._persona_notes)
+
+        save_row = QHBoxLayout()
+        save_btn = QPushButton("💾 Save as profile")
+        save_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        save_btn.clicked.connect(lambda: self._on_persona_save(activate=False))
+        save_row.addWidget(save_btn)
+        save_use_btn = QPushButton("Save and switch")
+        save_use_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        save_use_btn.clicked.connect(lambda: self._on_persona_save(activate=True))
+        save_row.addWidget(save_use_btn)
+        save_row.addStretch(1)
+        play.addLayout(save_row)
+
+        self._persona_status = QLabel("")
+        self._persona_status.setStyleSheet(f"color: {C.TEXT_MED}; font-size: 11px;")
+        self._persona_status.setWordWrap(True)
+        play.addWidget(self._persona_status)
+
+        self._refresh_personas()
+        return card
+
+    def _refresh_personas(self, select: str | None = None):
+        try:
+            from memory import persona_profiles
+            profiles = persona_profiles.list_profiles()
+            active = persona_profiles.get_active_name()
+        except Exception as e:
+            self._persona_status.setText(f"Could not load personas: {e}")
+            return
+        target = select or active
+        self._persona_combo.blockSignals(True)
+        self._persona_combo.clear()
+        for p in profiles:
+            label = p["name"] + ("  (active)" if p["name"] == active else "")
+            self._persona_combo.addItem(label, p["name"])
+        idx = self._persona_combo.findData(target)
+        self._persona_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        self._persona_combo.blockSignals(False)
+        self._on_persona_picked(self._persona_combo.currentIndex())
+        if active:
+            self._persona_status.setText(f"Active persona: {active}")
+
+    def _on_persona_picked(self, _index: int):
+        try:
+            from memory import persona_profiles
+            name = self._persona_combo.currentData()
+            p = persona_profiles.get_profile(name) if name else None
+        except Exception:
+            p = None
+        if not p:
+            return
+        self._persona_name.setText(p["name"])
+        vidx = self._persona_voice.findData(p["voice"])
+        if vidx >= 0:
+            self._persona_voice.setCurrentIndex(vidx)
+        self._persona_notes.setPlainText(p.get("instructions", ""))
+
+    def _apply_persona_to_controls(self, p: dict):
+        """Keep the older single name / voice controls in step with the persona."""
+        try:
+            if hasattr(self, "_set_ast_name"):
+                self._set_ast_name.blockSignals(True)
+                self._set_ast_name.setText(p["name"])
+                self._set_ast_name.blockSignals(False)
+            if hasattr(self, "_voice_combo"):
+                vidx = self._voice_combo.findData(p["voice"])
+                if vidx >= 0:
+                    self._voice_combo.blockSignals(True)
+                    self._voice_combo.setCurrentIndex(vidx)
+                    self._voice_combo.blockSignals(False)
+        except Exception:
+            pass
+
+    def _activate_persona(self, name: str):
+        from memory import persona_profiles
+        p = persona_profiles.activate(name)
+        self._apply_persona_to_controls(p)
+        self._refresh_personas(select=p["name"])
+        self._persona_status.setText(
+            f"✅ Switched to {p['name']} ({p['voice']} voice). Reconnecting the voice session…")
+
+    def _on_persona_switch(self):
+        name = self._persona_combo.currentData()
+        if not name:
+            return
+        try:
+            self._activate_persona(name)
+        except Exception as e:
+            self._persona_status.setText(f"Could not switch persona: {e}")
+
+    def _on_persona_save(self, activate: bool):
+        try:
+            from memory import persona_profiles
+            p = persona_profiles.save_profile(
+                self._persona_name.text(),
+                self._persona_voice.currentData(),
+                self._persona_notes.toPlainText(),
+            )
+            if activate:
+                self._activate_persona(p["name"])
+            else:
+                self._refresh_personas(select=p["name"])
+                self._persona_status.setText(f"✅ Saved persona {p['name']}.")
+        except Exception as e:
+            self._persona_status.setText(f"Could not save persona: {e}")
+
+    def _on_persona_delete(self):
+        name = self._persona_combo.currentData()
+        if not name:
+            return
+        try:
+            from memory import persona_profiles
+            persona_profiles.delete_profile(name)
+            self._refresh_personas()
+            self._persona_status.setText(f"Deleted persona {name}.")
+        except Exception as e:
+            self._persona_status.setText(f"Could not delete persona: {e}")
 
     def _on_input_device_changed(self, name: str):
         try:

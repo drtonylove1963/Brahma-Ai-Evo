@@ -132,6 +132,29 @@ LIVE_CONNECT_TIMEOUT = 12
 # int16 RMS a mic block needs before it can count as the user talking over Brahma
 # (~-40 dBFS: above headset hiss and breathing, well below normal speech).
 _BARGE_MIN_LEVEL    = 320.0
+
+_VOICE_LOG_LOCK = threading.Lock()
+
+
+def _voice_log(msg: str) -> None:
+    """Append a timestamped line to BrahmaAI/logs/voice.log.
+
+    The packaged exe has no console, so this is the only record of why a
+    spoken reply stopped (Esc, PTT, voice on the mic, Gemini, idle playback)."""
+    try:
+        from core.user_paths import get_user_data_dir
+        log_dir = get_user_data_dir() / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        path = log_dir / "voice.log"
+        now = time.time()
+        line = f"{time.strftime('%H:%M:%S', time.localtime(now))}.{int(now % 1 * 1000):03d} {msg}\n"
+        with _VOICE_LOG_LOCK:
+            if path.exists() and path.stat().st_size > 2_000_000:
+                path.replace(log_dir / "voice.log.1")
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(line)
+    except Exception:
+        pass
 _SINGLE_INSTANCE_MUTEX = None
 
 
@@ -243,7 +266,12 @@ def _load_system_prompt() -> str:
         role = identity.get_owner_role()
         mode = identity.get_behavior_mode()
         
-        identity_str = f"You are {ast_name}. You are assisting {own_name}"
+        identity_str = (
+            f"Your name is {ast_name}. Always refer to yourself as {ast_name}, even where "
+            f"the instructions below call the assistant Brahma or Brahma Evo "
+            f"(that is the app's name, not yours).\n"
+        )
+        identity_str += f"You are {ast_name}. You are assisting {own_name}"
         if role:
             identity_str += f" (Role: {role}).\n"
         else:
@@ -1121,6 +1149,21 @@ TOOL_DECLARATIONS = [
                 "monitor": {"type": "STRING", "description": "Which screen to capture when the user has several: a number counted left to right ('1', '2', '3'), or 'left', 'right', 'middle', 'primary'. Omit to capture every screen."}
             },
             "required": ["text"]
+        }
+    },
+    {
+        "name": "switch_persona",
+        "description": (
+            "Switches the assistant to a saved persona profile (its name, voice and personality), "
+            "or lists the saved personas. Call when the user says things like 'switch to Athena', "
+            "'become Jarvis', 'change persona', or 'what personas do I have'. "
+            "After switching, say one short line; the session then reconnects in the new voice."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "name": {"type": "STRING", "description": "Persona to switch to. Omit to list saved personas."}
+            }
         }
     },
     {
@@ -2259,11 +2302,11 @@ class BrahmaLive:
     def _on_ptt(self, held: bool) -> None:
         self._ptt_held = held
         if held:
-            self.trigger_barge_in()
+            self.trigger_barge_in("push-to-talk")
 
     def _on_stop_key(self, held: bool) -> None:
         if held:
-            self.trigger_barge_in()
+            self.trigger_barge_in("esc")
 
     def _reset_idle_activity(self):
         self._last_activity = time.monotonic()
@@ -2305,6 +2348,11 @@ class BrahmaLive:
                     if self.session and self._loop:
                         import asyncio
                         async def _send():
+                            # Don't start a new turn over a reply in progress (cuts it off).
+                            if self._is_speaking or self._turn_open:
+                                _voice_log("idle proactive prompt skipped: reply in progress")
+                                return
+                            _voice_log("idle proactive prompt sent")
                             try:
                                 content = types.Content(role="user", parts=[types.Part.from_text(text=prompt)])
                                 await self.session.send_client_content(turns=[content], turn_complete=True)
@@ -5013,11 +5061,13 @@ class BrahmaLive:
         elif not self.ui.muted:
             self.ui.set_state("LISTENING")
 
-    def trigger_barge_in(self):
+    def trigger_barge_in(self, reason: str = "unknown"):
         """Immediately interrupts AI speech playback and switches state to LISTENING."""
         with self._speaking_lock:
             if not self._is_speaking:
+                _voice_log(f"barge-in ignored (not speaking): {reason}")
                 return
+            _voice_log(f"BARGE-IN: {reason}")
             self._is_speaking = False
             # Gemini streams faster than we play, so it may still be generating.
             # Discard the rest of this turn, or the receive loop replays it.
@@ -5065,10 +5115,19 @@ class BrahmaLive:
             # Route text through Gemini Live API for the unified native Charon voice
             import asyncio
             async def _send():
+                # A new user turn makes Gemini abandon the reply it is giving, so
+                # a proactive update sent mid-reply cuts Brahma off. Wait (up to
+                # 60s) for the current reply to finish playing first.
+                waited = 0.0
+                while (self._is_speaking or self._turn_open) and waited < 60.0:
+                    await asyncio.sleep(0.25)
+                    waited += 0.25
+                _voice_log(f"proactive speak after {waited:.1f}s wait "
+                           f"(speaking={self._is_speaking}, turn_open={self._turn_open}): {text[:80]!r}")
                 try:
                     prompt = (
                         f"Deliver this update aloud to the user right now in your own voice. "
-                        f"Speak directly to the user as Brahma Evo without saying thank you or acknowledging this prompt:\n{text}"
+                        f"Speak directly to the user as yourself without saying thank you or acknowledging this prompt:\n{text}"
                     )
                     content = types.Content(role="user", parts=[types.Part.from_text(text=prompt)])
                     await self.session.send_client_content(turns=[content], turn_complete=True)
@@ -5171,11 +5230,15 @@ class BrahmaLive:
     def _build_config(self) -> types.LiveConnectConfig:
         from datetime import datetime
 
+        from memory import persona_profiles
         voice = config_manager.get_voice_name()
-        if voice != getattr(self, "_active_voice", voice):
-            # Start fresh rather than resume, so the new voice is the one used.
+        persona_rev = persona_profiles.get_persona_rev()
+        if (voice != getattr(self, "_active_voice", voice)
+                or persona_rev != getattr(self, "_active_persona_rev", persona_rev)):
+            # Start fresh rather than resume, so the new voice and persona are used.
             self._resume_handle = None
         self._active_voice = voice
+        self._active_persona_rev = persona_rev
 
         memory     = load_memory()
         mem_str    = format_memory_for_prompt(memory)
@@ -5284,10 +5347,13 @@ class BrahmaLive:
         )
 
     async def _watch_voice(self):
-        """End the session once the voice setting changes, so run() reconnects with it."""
+        """End the session once the voice or persona changes, so run() reconnects with it."""
+        from memory import persona_profiles
         while True:
             await asyncio.sleep(1.0)
-            if config_manager.get_voice_name() != self._active_voice and not self._is_speaking:
+            changed = (config_manager.get_voice_name() != self._active_voice
+                       or persona_profiles.get_persona_rev() != getattr(self, "_active_persona_rev", 0))
+            if changed and not self._is_speaking and not self._turn_open:
                 raise _VoiceChanged()
 
     async def _execute_tool(self, fc) -> types.FunctionResponse:
@@ -5659,6 +5725,22 @@ class BrahmaLive:
                     lambda: create_pdf(parameters=args, player=self.ui)
                 )
                 result = r or "PDF created."
+
+            elif name == "switch_persona":
+                from memory import persona_profiles
+                wanted = str(args.get("name") or "").strip()
+                saved = persona_profiles.list_profiles()
+                names = ", ".join(p["name"] for p in saved) or "none"
+                if not wanted:
+                    result = (f"Saved personas: {names}. "
+                              f"Active: {persona_profiles.get_active_name() or 'none'}.")
+                elif persona_profiles.get_profile(wanted) is None:
+                    result = f"No saved persona called {wanted}. Saved personas: {names}."
+                else:
+                    p = persona_profiles.activate(wanted)
+                    self.ui.write_log(f"SYS: Persona switched to {p['name']} ({p['voice']} voice).")
+                    result = (f"Switched to persona {p['name']} with the {p['voice']} voice. "
+                              f"The session reconnects as {p['name']} after this reply.")
 
             elif name == "screen_process":
                 # Analyse to text and let this session say it: the old path spoke
@@ -6137,7 +6219,10 @@ class BrahmaLive:
                             self._barge_run = 0
                         barge = self._barge_run >= self._echo.required_blocks
                     if barge:
-                        self.trigger_barge_in()
+                        self.trigger_barge_in(
+                            "push-to-talk held" if getattr(self, "_ptt_held", False)
+                            else f"voice on mic (level {lvl:.0f}, {self._barge_run} blocks)"
+                        )
                         data = indata.tobytes()
                     else:
                         data = np.zeros_like(indata).tobytes()
@@ -6235,8 +6320,10 @@ class BrahmaLive:
 
                         if getattr(sc, "interrupted", False):
                             # Gemini heard the user talk over it: stop playing what's queued.
-                            self.trigger_barge_in()
+                            self.trigger_barge_in("gemini server said interrupted")
                         if sc.turn_complete or getattr(sc, "interrupted", False):
+                            _voice_log("turn " + ("INTERRUPTED by gemini" if getattr(sc, "interrupted", False)
+                                                  else "complete"))
                             self._turn_open = False
                             self._drop_reply = False
 
@@ -6306,6 +6393,7 @@ class BrahmaLive:
                         chunk = await self.audio_in_queue.get()
                 except asyncio.TimeoutError:
                     if self._is_speaking:
+                        _voice_log(f"playback idle 350ms -> not speaking (turn_open={self._turn_open})")
                         self.set_speaking(False)
                     continue
 
